@@ -78,6 +78,16 @@ static float g_lockAngleHoldReduce = 0.15f;
 static float g_angleHoldPreFovDeg = 1.2f;
 static float g_angleHoldMaxDeltaDeg = 1.0f;
 
+static float g_exposureWindowS = 0.25f;
+static float g_exposureConeDeg = 15.0f;
+static float g_exposureNeedS = 0.10f;
+static float g_exposureSoftScale = 0.50f;
+static float g_farRangeM = 12.0f;
+
+static bool g_banEnabled  = true;
+static std::string g_banAction = "admin";
+static std::string g_banCommand = "";
+
 static bool g_excludeWarmup = false;
 static int g_banMinutes = 0;
 static std::string g_reason = "Использование aimbot";
@@ -95,6 +105,43 @@ static inline void Dbg(const char* fmt, ...)
 static inline float Now() 
 { 
     return gpGlobals ? gpGlobals->curtime : 0.0f; 
+}
+
+static inline std::string ToLower(std::string s) 
+{
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c){ return (char)std::tolower(c); });
+    return s;
+}
+
+static inline void ReplaceAll(std::string& s, const std::string& what, const std::string& with) 
+{
+    if (what.empty()) return;
+    size_t pos = 0;
+    while ((pos = s.find(what, pos)) != std::string::npos) {
+        s.replace(pos, what.size(), with);
+        pos += with.size();
+    }
+}
+
+static inline std::string EscapeForCmd(const std::string& in) 
+{
+    std::string out; out.reserve(in.size());
+    for (char c: in) {
+        if (c=='"')  out += "\\\"";
+        else if (c=='\n' || c=='\r') out += ' ';
+        else out += c;
+    }
+    return out;
+}
+
+static inline std::string Steam64Str(int slot) 
+{
+    if (auto* c = CCSPlayerController::FromSlot(slot)) {
+        uint64 sid = (uint64)c->m_steamID();
+        if (sid > 0) return std::to_string(sid);
+    }
+    return "0";
 }
 
 static inline float AngleBetween(const Vector& a, const Vector& b)
@@ -500,18 +547,65 @@ static void TryBan(int slot, float add, const char* why)
     g_ps[slot].suspicion += add;
     Dbg("susp slot=%d +=%.1f -> %.1f (%s)", slot, add, g_ps[slot].suspicion, why?why:"");
 
-    if (g_excludeWarmup)
-    {
-        CCSGameRules* rules = g_pUtils ? g_pUtils->GetCCSGameRules() : nullptr;
-        if (rules && rules->m_bWarmupPeriod()) return;
+    if (g_excludeWarmup) {
+        if (auto* rules = g_pUtils ? g_pUtils->GetCCSGameRules() : nullptr; rules && rules->m_bWarmupPeriod())
+            return;
+    }
+    if (g_ps[slot].suspicion < g_threshold) return;
+
+    if (!g_banEnabled || g_banAction == "none") {
+        Dbg("DETECTED slot=%d score=%.1f thr=%.1f (ban disabled/none).", slot, g_ps[slot].suspicion, g_threshold);
+        g_ps[slot].suspicion = 0.0f;
+        return;
     }
 
-    if (g_ps[slot].suspicion >= g_threshold)
-    {
-        if (g_pAdmin) g_pAdmin->AddPlayerPunishment(slot, RT_BAN, g_banMinutes, g_reason.c_str());
-        else if (engine) engine->DisconnectClient(CPlayerSlot(slot), NETWORK_DISCONNECT_KICKED);
-        g_ps[slot].suspicion = 0.0f;
+    const std::string sid64    = Steam64Str(slot);
+    const std::string minutes  = std::to_string(g_banMinutes);
+    const std::string reasonRaw= EscapeForCmd(g_reason);
+    const std::string reasonQ  = std::string("\"") + reasonRaw + "\"";
+
+    bool done = false;
+
+    if (g_banAction == "command" && !g_banCommand.empty() && engine) {
+        std::string cmd = g_banCommand;
+
+        ReplaceAll(cmd, "{slot}",       std::to_string(slot));
+        ReplaceAll(cmd, "{userid}",     std::to_string(slot));
+        ReplaceAll(cmd, "{steamid64}",  sid64);
+        ReplaceAll(cmd, "{minutes}",    minutes);
+        ReplaceAll(cmd, "{reason_q}",   reasonQ);
+        ReplaceAll(cmd, "{reason}",     reasonRaw);
+
+        if (cmd.empty() || cmd.back() != '\n') cmd += "\n";
+        engine->ServerCommand(cmd.c_str());
+        Dbg("BAN slot=%d via custom command: %s", slot, g_banCommand.c_str());
+        done = true;
     }
+    else if (g_banAction == "admin" && g_pAdmin) {
+        g_pAdmin->AddPlayerPunishment(slot, RT_BAN, g_banMinutes, g_reason.c_str());
+        Dbg("BAN slot=%d via AdminApi minutes=%d reason='%s'", slot, g_banMinutes, g_reason.c_str());
+        done = true;
+    }
+    else if (g_banAction == "disconnect" && engine) {
+        engine->DisconnectClient(CPlayerSlot(slot), NETWORK_DISCONNECT_KICKED);
+        Dbg("BAN slot=%d via disconnect reason='%s'", slot, g_reason.c_str());
+        done = true;
+    }
+    else {
+        if (g_pAdmin) {
+            g_pAdmin->AddPlayerPunishment(slot, RT_BAN, g_banMinutes, g_reason.c_str());
+            Dbg("BAN slot=%d via fallback AdminApi minutes=%d reason='%s'", slot, g_banMinutes, g_reason.c_str());
+            done = true;
+        } else if (engine) {
+            engine->DisconnectClient(CPlayerSlot(slot), NETWORK_DISCONNECT_KICKED);
+            Dbg("BAN slot=%d via fallback disconnect reason='%s'", slot, g_reason.c_str());
+            done = true;
+        } else {
+            Dbg("DETECTED slot=%d but no ban path available.", slot);
+        }
+    }
+
+    if (done) g_ps[slot].suspicion = 0.0f;
 }
 
 static inline std::string NormalizeWeaponName(const char* w)
@@ -522,12 +616,14 @@ static inline std::string NormalizeWeaponName(const char* w)
     if (s.rfind("weapon_", 0) == 0) s.erase(0, 7);
     return s;
 }
+
 static inline bool IsGrenadeName(const std::string& s)
 {
     return s=="hegrenade" || s=="flashbang" || s=="smokegrenade" ||
-           s=="molotov"  || s=="decoy"     || s=="tagrenade"   ||
+           s=="molotov"  || s=="decoy" || s=="tagrenade" ||
            s=="inferno";
 }
+
 static inline bool IsGrenadeEvent(IGameEvent* ev)
 {
     const char* w = ev->GetString("weapon", "");
@@ -554,6 +650,38 @@ static void OnWeaponFire(const char*, IGameEvent* ev, bool)
     Dbg("shot slot=%d t=%.3f", slot, g_ps[slot].lastShotT);
 }
 
+static float VictimExposure(int attacker, int victim, float tKill, float windowS, float coneDeg)
+{
+    const auto& buf = g_ps[attacker].buf;
+    if (buf.empty()) return 0.0f;
+
+    CCSPlayerController* atk = CCSPlayerController::FromSlot(attacker);
+    CCSPlayerController* vic = CCSPlayerController::FromSlot(victim);
+    if (!atk || !vic) return 0.0f;
+    CCSPlayerPawn* ap = atk->GetPlayerPawn();
+    CCSPlayerPawn* vp = vic->GetPlayerPawn();
+    if (!ap || !vp) return 0.0f;
+
+    Vector eyeA = EyePos(ap), eyeV = EyePos(vp);
+    Vector toV = eyeV - eyeA; float l2 = toV.x*toV.x + toV.y*toV.y + toV.z*toV.z;
+    if (l2 < 1e-6f) return 0.0f; float inv = 1.0f/std::sqrt(l2);
+    toV.x*=inv; toV.y*=inv; toV.z*=inv;
+
+    float tFrom = tKill - windowS;
+    bool have=false, lastIn=false; float lastT=0.0f, vis=0.0f;
+
+    for (const auto& s: buf) {
+        if (s.t < tFrom || s.t > tKill) continue;
+        Vector aim; AnglesToDir(s.pitch, s.yaw, aim);
+        float fov = AngleBetween(aim, toV); bool in = (fov <= coneDeg);
+        if (!have) { have=true; lastT=s.t; lastIn=in; continue; }
+        float dt = s.t - lastT; if (dt>0.0f && lastIn) vis += dt;
+        lastT = s.t; lastIn = in;
+    }
+    if (have && lastIn) vis += std::max(0.0f, tKill - lastT);
+    return vis;
+}
+
 static void OnPlayerDeath(const char*, IGameEvent* ev, bool)
 {
     if (IsGrenadeEvent(ev)) {
@@ -564,23 +692,21 @@ static void OnPlayerDeath(const char*, IGameEvent* ev, bool)
         return;
     }
 
-    int victim = ev->GetInt("userid");
+    int victim   = ev->GetInt("userid");
     int attacker = ev->GetInt("attacker");
-    bool head = ev->GetInt("headshot") != 0;
-    if (attacker<0 || attacker>=64 || victim<0 || victim>=64 || attacker==victim) return;
+    bool head    = ev->GetInt("headshot") != 0;
+    if (attacker < 0 || attacker >= 64 || victim < 0 || victim >= 64 || attacker == victim) return;
 
     float distM = -1.0f;
-    CCSPlayerController* atk = CCSPlayerController::FromSlot(attacker);
-    CCSPlayerController* vic = CCSPlayerController::FromSlot(victim);
-    if (atk && vic)
-    {
-        CCSPlayerPawn* ap = atk->GetPlayerPawn();
-        CCSPlayerPawn* vp = vic->GetPlayerPawn();
-        if (ap && vp)
-        {
-            Vector d = EyePos(vp) - EyePos(ap);
-            float u = std::sqrt(std::max(0.0f, d.x*d.x + d.y*d.y + d.z*d.z));
-            distM = UnitsToMeters(u);
+    if (auto* atk = CCSPlayerController::FromSlot(attacker)) {
+        if (auto* vic = CCSPlayerController::FromSlot(victim)) {
+            if (auto* ap = atk->GetPlayerPawn()) {
+                if (auto* vp = vic->GetPlayerPawn()) {
+                    Vector d = EyePos(vp) - EyePos(ap);
+                    float u = std::sqrt(std::max(0.0f, d.x*d.x + d.y*d.y + d.z*d.z));
+                    distM = UnitsToMeters(u);
+                }
+            }
         }
     }
 
@@ -590,10 +716,10 @@ static void OnPlayerDeath(const char*, IGameEvent* ev, bool)
     float tFrom = tKill - g_analysisWindow;
 
     bool crouchAdj = CrouchAdjustSeen(g_ps[attacker].buf, tFrom, tKill, g_crouchEyeZDeltaMin);
-    bool vertDom = VerticalDominant  (g_ps[attacker].buf, tFrom, tKill, g_verticalDomRatio);
+    bool vertDom   = VerticalDominant  (g_ps[attacker].buf, tFrom, tKill, g_verticalDomRatio);
 
-    float fovVictimShot=0.0f, pitchToVictimDeg=0.0f;
-    bool haveVictimGeom = FovToVictimAtShot(attacker, victim, tKill, fovVictimShot, pitchToVictimDeg);
+    float fovVictimShot = 0.0f, pitchToVictimDeg = 0.0f;
+    bool  haveVictimGeom = FovToVictimAtShot(attacker, victim, tKill, fovVictimShot, pitchToVictimDeg);
 
     float addSilent = 0.0f;
     if (g_ps[attacker].lastShotT > 0.0f && (tKill - g_ps[attacker].lastShotT) <= g_maxShotAge && haveVictimGeom)
@@ -607,7 +733,7 @@ static void OnPlayerDeath(const char*, IGameEvent* ev, bool)
         }
     }
 
-    float preFov=0.0f, maxDelta=0.0f;
+    float preFov = 0.0f, maxDelta = 0.0f;
     float addSnap = AnalyzeSnap(g_ps[attacker].buf, tKill, g_analysisWindow, preFov, maxDelta);
 
     float nearBoost = 0.0f;
@@ -625,7 +751,7 @@ static void OnPlayerDeath(const char*, IGameEvent* ev, bool)
     if (addSnap > 0.0f && crouchAdj && vertDom)
         addSnap *= 0.2f;
 
-    float bestHold=0.0f; bool bestWasAcq=false; float dbgPrevFov=180.0f, dbgPreMaxDelta=0.0f;
+    float bestHold = 0.0f; bool bestWasAcq = false; float dbgPrevFov = 180.0f, dbgPreMaxDelta = 0.0f;
     float addLock = AnalyzeLockHold(g_ps[attacker].buf, tKill, g_analysisWindow,
                                     bestHold, bestWasAcq, dbgPrevFov, dbgPreMaxDelta);
 
@@ -637,9 +763,23 @@ static void OnPlayerDeath(const char*, IGameEvent* ev, bool)
 
     float addCont = AnalyzeContinuity(g_ps[attacker].buf, tKill, std::min(g_continuityWindowS, g_analysisWindow));
 
-    float baseMaxD=0.0f, baseAvgD=0.0f, baseLockF=0.0f;
+    float baseMaxD = 0.0f, baseAvgD = 0.0f, baseLockF = 0.0f;
     ComputeBaseline(g_ps[attacker].buf, tKill, baseMaxD, baseAvgD, baseLockF);
-    if (addSnap>0.0f && maxDelta <= baseMaxD + 3.0f) addSnap *= 0.5f;
+    if (addSnap > 0.0f && maxDelta <= baseMaxD + 3.0f) addSnap *= 0.5f;
+
+    float exposureS     = VictimExposure(attacker, victim, tKill, std::min(g_exposureWindowS, g_analysisWindow), g_exposureConeDeg);
+    bool  exposureEnough= (exposureS >= g_exposureNeedS);
+    bool  isFar         = (distM > 0.0f && distM >= g_farRangeM);
+
+    auto killIfLowExposure = [&](float& score, bool hardZero){
+        if (score <= 0.0f) return;
+        if (exposureEnough || isFar) return;
+        if (hardZero) score = 0.0f; else score *= g_exposureSoftScale;
+    };
+
+    killIfLowExposure(addSilent, /*hardZero*/ true);
+    killIfLowExposure(addSnap,   /*hardZero*/ true);
+    if (!exposureEnough && !isFar && addLock > 0.0f) addLock *= g_exposureSoftScale;
 
     float relief = HumanApproachRelief(g_ps[attacker].buf, tKill,
                                        std::min(g_approachWindowS, g_analysisWindow),
@@ -655,13 +795,13 @@ static void OnPlayerDeath(const char*, IGameEvent* ev, bool)
         "snap{max=%.1f thr=%.1f preFov=%.1f} lock{hold=%.2fs acq=%d prevFov=%.1f preMaxΔ=%.1f need=%.2fs} "
         "silent{fovVictim=%.1f pitchToVictim=%.1f} cont{w=%.1f} "
         "baseline{max=%.1f avg=%.2f lock=%.2f} "
-        "ctx{crouch=%d vertDom=%d}",
+        "ctx{crouch=%d vertDom=%d expo=%.3fs enough=%d}",
         attacker, victim, (distM>0.0f?distM:-1.0f), addTotal,
         maxDelta, scaledSnapThreshold, preFov,
         bestHold, (int)bestWasAcq, dbgPrevFov, dbgPreMaxDelta, g_lockHoldNeed,
         (haveVictimGeom?fovVictimShot:-1.0f), (haveVictimGeom?pitchToVictimDeg:-1.0f), addCont,
         baseMaxD, baseAvgD, baseLockF,
-        (int)crouchAdj, (int)vertDom
+        (int)crouchAdj, (int)vertDom, exposureS, (int)exposureEnough
     );
 
     TryBan(attacker, addTotal, "score");
@@ -766,6 +906,17 @@ static void LoadConfig()
     g_angleHoldPreFovDeg    = kv->GetFloat("angle_hold_prefov_deg",    g_angleHoldPreFovDeg);
     g_angleHoldMaxDeltaDeg  = kv->GetFloat("angle_hold_maxdelta_deg",  g_angleHoldMaxDeltaDeg);
 
+    g_exposureWindowS   = kv->GetFloat("exposure_window_s",   g_exposureWindowS);
+    g_exposureConeDeg   = kv->GetFloat("exposure_cone_deg",   g_exposureConeDeg);
+    g_exposureNeedS     = kv->GetFloat("exposure_need_s",     g_exposureNeedS);
+    g_exposureSoftScale = kv->GetFloat("exposure_soft_scale", g_exposureSoftScale);
+    g_farRangeM         = kv->GetFloat("far_range_m",         g_farRangeM);
+
+    g_banEnabled = kv->GetBool("ban_enabled", g_banEnabled);
+    const char* act = kv->GetString("ban_action", g_banAction.c_str());
+    g_banAction = ToLower(act ? act : g_banAction.c_str());
+    g_banCommand = kv->GetString("ban_command", g_banCommand.c_str());
+
     Dbg("cfg: dt=%.3f win=%.2f | cap=%d decim=%d | "
         "close<=%.2fm x%.2f | crouchΔZ>=%.1f vertDom>=%.2f | "
         "snapNear+%.1f/м snapVert+%.1f/° headshotNoBonus>=%.1f° | "
@@ -848,7 +999,7 @@ const char* AntiAimbot::GetLicense()
 
 const char* AntiAimbot::GetVersion()
 {
-    return "1.0";
+    return "1.0.1";
 }
  
 const char* AntiAimbot::GetDate()
