@@ -1,3 +1,5 @@
+![GitHub all releases](https://img.shields.io/github/downloads/ABKAM2023/cs2-antiaimbot/total?style=for-the-badge)
+
 ## RU
 **Anti-Aimbot** - плагин для автоматического выявления и бана игроков, использующих anti-aim, silent-aim и aimbot (отдельные разновидности aimbot могут не определяться). Плагин не создаёт заметной нагрузки на сервер. В ходе тестирования ложных банов не выявлено; теоретически они маловероятны. Если столкнётесь с ошибочным баном, пожалуйста, сообщите в Discord: https://discord.gg/ChYfTtrtmS
 
