@@ -978,9 +978,6 @@ void AntiAimbot::AllPluginsLoaded()
     {
         g_SMAPI->Format(error, sizeof(error), "Missing IAdminApi system plugin");
         ConColorMsg(Color(255,0,0,255), "[%s] %s\n", GetLogTag(), error);
-        std::string s = "meta unload " + std::to_string(g_PLID);
-        if (engine) engine->ServerCommand(s.c_str());
-        return;
     }
 
     g_pUtils->StartupServer(g_PLID, StartupServer);
