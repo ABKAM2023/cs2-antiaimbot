@@ -92,6 +92,8 @@ static bool g_excludeWarmup = false;
 static int g_banMinutes = 0;
 static std::string g_reason = "Использование aimbot";
 
+static float g_banDebounceS = 6.0f;
+
 static inline void Dbg(const char* fmt, ...)
 {
     if (!g_debug) return;
@@ -217,7 +219,7 @@ struct Sample
 
 struct PState
 {
-    bool haveLastDir=false;
+    bool  haveLastDir=false;
     Vector lastDir{0,0,0};
     float lastYaw=0.0f, lastPitch=0.0f;
 
@@ -226,8 +228,26 @@ struct PState
     float lastKillT = -1.0f;
 
     float suspicion = 0.0f;
+
+    bool  punish_guard = false;
+    float guard_until = 0.0f;
 };
+
 static PState g_ps[64];
+
+static inline bool IsBanGuardActive(int slot)
+{
+    if (slot < 0 || slot >= 64) return false;
+
+    PState& ps = g_ps[slot];
+    if (!ps.punish_guard) return false;
+
+    if (Now() >= ps.guard_until) {
+        ps.punish_guard = false;
+        return false;
+    }
+    return true;
+}
 
 static CTimer* g_sampler = nullptr;
 
@@ -544,6 +564,12 @@ static void ApplyRelief(int slot, float relief, const char* why)
 static void TryBan(int slot, float add, const char* why)
 {
     if (add <= 0.0f) return;
+
+    if (IsBanGuardActive(slot)) {
+        Dbg("BAN suppressed slot=%d (guard active till %.2f), add=%.1f", slot, g_ps[slot].guard_until, add);
+        return;
+    }
+
     g_ps[slot].suspicion += add;
     Dbg("susp slot=%d +=%.1f -> %.1f (%s)", slot, add, g_ps[slot].suspicion, why?why:"");
 
@@ -605,7 +631,11 @@ static void TryBan(int slot, float add, const char* why)
         }
     }
 
-    if (done) g_ps[slot].suspicion = 0.0f;
+    if (done) {
+        g_ps[slot].suspicion   = 0.0f;
+        g_ps[slot].punish_guard = true;
+        g_ps[slot].guard_until  = Now() + g_banDebounceS;
+    }
 }
 
 static inline std::string NormalizeWeaponName(const char* w)
@@ -637,6 +667,8 @@ static void OnWeaponFire(const char*, IGameEvent* ev, bool)
 {
     int slot = ev->GetInt("userid");
     if (slot < 0 || slot >= 64) return;
+
+    if (IsBanGuardActive(slot)) return; 
 
     if (IsGrenadeEvent(ev)) {
         if (g_debug) {
@@ -696,6 +728,11 @@ static void OnPlayerDeath(const char*, IGameEvent* ev, bool)
     int attacker = ev->GetInt("attacker");
     bool head    = ev->GetInt("headshot") != 0;
     if (attacker < 0 || attacker >= 64 || victim < 0 || victim >= 64 || attacker == victim) return;
+
+    if (IsBanGuardActive(attacker)) {
+        Dbg("death ignored: attacker slot=%d under ban-guard", attacker);
+        return;
+    }
 
     float distM = -1.0f;
     if (auto* atk = CCSPlayerController::FromSlot(attacker)) {
@@ -817,6 +854,8 @@ static void OnRoundStart(const char*, IGameEvent*, bool)
         g_ps[i].lastShotT = -1.0f;
         g_ps[i].lastKillT = -1.0f;
         g_ps[i].suspicion = 0.0f;
+        g_ps[i].punish_guard = false;
+        g_ps[i].guard_until  = 0.0f;      
     }
     Dbg("round_start: buffers reset");
 
@@ -996,7 +1035,7 @@ const char* AntiAimbot::GetLicense()
 
 const char* AntiAimbot::GetVersion()
 {
-    return "1.0.1";
+    return "1.0.2";
 }
  
 const char* AntiAimbot::GetDate()
